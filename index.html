@@ -570,17 +570,24 @@
   <div class="modal">
     <div class="modal-title">📖 Getting Google Credentials</div>
     <div class="modal-sub">Follow these steps to connect your company's Google Drive:</div>
-    <ol style="font-size:13px;color:var(--text2);line-height:2;padding-left:18px;">
-      <li>Go to <strong style="color:var(--accent2)">console.cloud.google.com</strong></li>
-      <li>Create/select a project → Enable <strong>Google Drive API</strong> & <strong>Google Picker API</strong></li>
-      <li>APIs &amp; Services → Credentials → Create <strong>API Key</strong></li>
-      <li>Create <strong>OAuth 2.0 Client ID</strong> → Web application</li>
-      <li>Add your domain to Authorized JavaScript Origins</li>
-      <li>Find your invoices folder in Drive → copy the ID from the URL</li>
+    <ol style="font-size:13px;color:var(--text2);line-height:2.2;padding-left:18px;">
+      <li>Go to <strong style="color:var(--accent2)">console.cloud.google.com</strong> → create or select a project</li>
+      <li><strong>APIs &amp; Services → Library</strong> → enable <strong>Google Drive API</strong></li>
+      <li><strong>APIs &amp; Services → Credentials → + Create Credentials → API Key</strong> — copy it</li>
+      <li><strong>+ Create Credentials → OAuth 2.0 Client ID</strong> → Application type: <strong>Web application</strong></li>
+      <li>Under <strong>Authorized JavaScript Origins</strong> add your exact domain:<br>
+        <code style="color:var(--accent);font-size:11px;">https://YOUR-USERNAME.github.io</code> &nbsp;and&nbsp;
+        <code style="color:var(--accent);font-size:11px;">http://localhost</code></li>
+      <li><strong>OAuth consent screen</strong> → add your Google account as a <strong>Test User</strong></li>
+      <li>Open your invoices folder in Drive → copy the ID from the URL</li>
     </ol>
     <div class="info-box">
-      <strong>Folder ID</strong> is the part after <code>/folders/</code> in the Google Drive URL.<br>
-      Example: <code>drive.google.com/drive/folders/<strong>1BxiMVs0XRA5...</strong></code>
+      <strong>⚠ Common causes of idpiframe_initialization_failed:</strong><br>
+      • Missing / wrong Authorized JavaScript Origins (must match your exact domain with no trailing slash)<br>
+      • Old <code>gapi.auth2</code> library — this app now uses the modern Google Identity Services ✓<br>
+      • Third-party cookies blocked — try Chrome with cookies enabled<br><br>
+      <strong>Folder ID</strong> is the part after <code>/folders/</code> in the Drive URL:<br>
+      <code>drive.google.com/drive/folders/<strong style="color:var(--accent2)">1BxiMVs0XRA5...</strong></code>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal('howto-modal')">Close</button>
@@ -606,43 +613,76 @@ const state = {
   driveConnected: false,
 };
 
-// ─── GOOGLE DRIVE ─────────────────────────────────────────────────────────────
+// ─── GOOGLE DRIVE (Google Identity Services + GAPI client) ───────────────────
+//
+//  Modern approach (gapi.auth2 was shut down by Google in 2023):
+//    1. gapi.client  → makes Drive REST calls
+//    2. google.accounts.oauth2  → handles the OAuth token pop-up
+//
 function connectGoogleDrive() {
-  const apiKey = document.getElementById('api-key').value.trim();
-  const clientId = document.getElementById('client-id').value.trim();
-  const folderId = document.getElementById('folder-id').value.trim();
+  const apiKey    = document.getElementById('api-key').value.trim();
+  const clientId  = document.getElementById('client-id').value.trim();
+  const folderId  = document.getElementById('folder-id').value.trim();
 
   if (!apiKey || !clientId || !folderId) {
     toast('Please fill in API Key, Client ID, and Folder ID', '⚠️');
     return;
   }
 
-  // Load GAPI
-  showAuthInfo('Loading Google APIs...');
-  const script = document.createElement('script');
-  script.src = 'https://apis.google.com/js/api.js';
-  script.onload = () => {
-    gapi.load('client:auth2', () => initGapiClient(apiKey, clientId, folderId));
-  };
-  script.onerror = () => showAuthInfo('Failed to load Google APIs. Check internet connection.');
-  document.head.appendChild(script);
+  showAuthInfo('⏳ Loading Google APIs…');
+
+  // Load both scripts in parallel, then wire them up
+  Promise.all([
+    loadScript('https://apis.google.com/js/api.js'),
+    loadScript('https://accounts.google.com/gsi/client'),
+  ]).then(() => {
+    // Step 1 – initialise gapi.client (no auth2, just the REST client)
+    gapi.load('client', async () => {
+      try {
+        await gapi.client.init({
+          apiKey,
+          discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'],
+        });
+        markStep('step-api', true);
+        showAuthInfo('✓ API client ready. Opening Google sign-in…');
+
+        // Step 2 – request an OAuth access token via the new GIS library
+        const tokenClient = google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: 'https://www.googleapis.com/auth/drive.readonly',
+          callback: async (tokenResponse) => {
+            if (tokenResponse.error) {
+              showAuthInfo('❌ Auth error: ' + tokenResponse.error);
+              return;
+            }
+            // Token is automatically stored by gapi.client — just proceed
+            markStep('step-auth', true);
+            showAuthInfo('✓ Signed in! Scanning folder…');
+            await scanDriveFolder(folderId);
+          },
+        });
+
+        tokenClient.requestAccessToken({ prompt: 'consent' });
+
+      } catch (err) {
+        showAuthInfo('❌ ' + (err.message || JSON.stringify(err)));
+      }
+    });
+  }).catch(err => {
+    showAuthInfo('❌ Failed to load Google scripts. Check your internet connection.');
+    console.error(err);
+  });
 }
 
-function initGapiClient(apiKey, clientId, folderId) {
-  gapi.client.init({
-    apiKey,
-    clientId,
-    discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'],
-    scope: 'https://www.googleapis.com/auth/drive.readonly'
-  }).then(() => {
-    showAuthInfo('✓ Google API loaded. Signing in...');
-    return gapi.auth2.getAuthInstance().signIn();
-  }).then(() => {
-    showAuthInfo('✓ Signed in! Scanning folder...');
-    markStep('step-api', true); markStep('step-auth', true);
-    return scanDriveFolder(folderId);
-  }).catch(err => {
-    showAuthInfo('Error: ' + (err.error || err.message || JSON.stringify(err)));
+/** Dynamically load a script, returns a Promise */
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Failed to load ' + src));
+    document.head.appendChild(s);
   });
 }
 
